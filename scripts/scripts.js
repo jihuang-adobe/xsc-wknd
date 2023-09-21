@@ -14,9 +14,45 @@ import {
   getMetadata,
   decorateBlock,
   loadBlock,
+  loadScript,
+  toCamelCase,
+  toClassName,
 } from './lib-franklin.js';
 
 const LCP_BLOCKS = []; // add your LCP blocks to the list
+
+/**
+ * Gets all the metadata elements that are in the given scope.
+ * @param {String} scope The scope/prefix for the metadata
+ * @returns an array of HTMLElement nodes that match the given scope
+ */
+export function getAllMetadata(scope) {
+  return [...document.head.querySelectorAll(`meta[property^="${scope}:"],meta[name^="${scope}-"]`)]
+    .reduce((res, meta) => {
+      const id = toClassName(meta.name
+        ? meta.name.substring(scope.length + 1)
+        : meta.getAttribute('property').split(':')[1]);
+      res[id] = meta.getAttribute('content');
+      return res;
+    }, {});
+}
+
+// Define an execution context
+const pluginContext = {
+  getAllMetadata,
+  getMetadata,
+  loadCSS,
+  loadScript,
+  sampleRUM,
+  toCamelCase,
+  toClassName,
+};
+
+const AUDIENCES = {
+  mobile: () => window.innerWidth < 600,
+  desktop: () => window.innerWidth >= 600,
+  // define your custom audiences here as needed
+};
 
 export function addVideo(element, href) {
   element.innerHTML = `<video loop muted playsInline>
@@ -39,11 +75,10 @@ export function addVideo(element, href) {
  * @param {Element} main The container element
  */
 function buildHeroBlock(main) {
-  if(getMetadata('template') === 'fragment') return;
   const h1 = main.querySelector('h1');
   const content = document.createElement('div');
   content.classList.add('hero-content');
-  content.append(h1);
+  if (h1) content.append(h1);
 
   const h2 = main.querySelector('h2');
   if (h2) {
@@ -229,6 +264,13 @@ function aggregateTabSectionsIntoComponents(main) {
  * @param {Element} doc The container element
  */
 async function loadEager(doc) {
+  if (getMetadata('experiment')
+    || Object.keys(getAllMetadata('campaign')).length
+    || Object.keys(getAllMetadata('audience')).length) {
+    // eslint-disable-next-line import/no-relative-packages
+    const { loadEager: runEager } = await import('../plugins/experience-decisioning/src/index.js');
+    await runEager.call(pluginContext, { audiences: AUDIENCES });
+  }
   document.documentElement.lang = 'en';
   decorateTemplateAndTheme();
   const main = doc.querySelector('main');
@@ -253,16 +295,23 @@ async function loadLazy(doc) {
   const element = hash ? doc.getElementById(hash.substring(1)) : false;
   if (hash && element) element.scrollIntoView();
 
-  if(getMetadata('template') !== 'fragment') {
-    loadHeader(doc.querySelector('header'));
-    loadFooter(doc.querySelector('footer'));
-  }
+  loadHeader(doc.querySelector('header'));
+  loadFooter(doc.querySelector('footer'));
 
   loadCSS(`${window.hlx.codeBasePath}/styles/lazy-styles.css`);
   addFavIcon(`${window.hlx.codeBasePath}/icons/favicon-32.png`);
   sampleRUM('lazy');
   sampleRUM.observe(main.querySelectorAll('div[data-block-name]'));
   sampleRUM.observe(main.querySelectorAll('picture > img'));
+
+  if ((getMetadata('experiment')
+    || Object.keys(getAllMetadata('campaign')).length
+    || Object.keys(getAllMetadata('audience')).length)
+    && (window.location.hostname.endsWith('hlx.page') || window.location.hostname === ('localhost'))) {
+    // eslint-disable-next-line import/no-relative-packages
+    const { loadLazy: runLazy } = await import('../plugins/experience-decisioning/src/index.js');
+    await runLazy.call(pluginContext, { audiences: AUDIENCES });
+  }
 }
 
 /**
@@ -323,6 +372,48 @@ export async function fetchJson(href) {
   }
 }
 
+export async function useGraphQL(query, param) {
+  const configPath = `${window.location.origin}/demo-config.json`;
+  let { data } = await fetchJson(configPath);
+  data = data && data[0];
+  if (!data) {
+    console.log('config not present'); // eslint-disable-line no-console
+    return;
+  }
+  const { origin } = window.location;
+
+  if (origin.includes('.live')) {
+    data['aem-author'] = data['aem-author'].replace('author', data['hlx.live']);
+  } else if (origin.includes('.page')) {
+    data['aem-author'] = data['aem-author'].replace('author', data['hlx.page']);
+  }
+  data['aem-author'] = data['aem-author'].replace(/\/+$/, '');
+  const { pathname } = new URL(query);
+  const url = param ? new URL(`${data['aem-author']}${pathname}${param}`) : new URL(`${data['aem-author']}${pathname}`);
+  try {
+    const resp = await fetch(
+      url,
+      {
+        headers: {
+          'Content-Type': 'text/html',
+        },
+        method: 'get',
+        credentials: 'include',
+      },
+    );
+
+    const error = new Error({
+      code: 500,
+      message: 'login error',
+    });
+
+    if (resp.redirected) throw (error);
+    return await resp.json(); // eslint-disable-line consistent-return
+  } catch (error) {
+    console.log(error); // eslint-disable-line no-console
+  }
+}
+
 export function addElement(type, attributes, values = {}) {
   const element = document.createElement(type);
 
@@ -339,9 +430,9 @@ export function addElement(type, attributes, values = {}) {
 
 loadPage();
 
-// document.querySelectorAll('meta').forEach((m) => {
-//   const prop = m.getAttribute('property');
-//   if(prop && prop.startsWith('urn:adobe')) {
-//     m.setAttribute('content', `aem:${m.getAttribute('content')}`);
-//   }
-// })
+document.querySelectorAll('meta').forEach((m) => {
+  const prop = m.getAttribute('property');
+  if (prop && prop.startsWith('urn:adobe')) {
+    m.setAttribute('content', `aem:${m.getAttribute('content')}`);
+  }
+});
